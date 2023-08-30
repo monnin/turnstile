@@ -1,0 +1,53 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: Turnstile
+message: >-
+  A Unidirectional System for Medium-Security Isolated
+  Clusters
+type: software
+authors:
+  - given-names: Mark
+    family-names: Monnin
+    email: mark.monnin@maine.edu
+    affiliation: University of Southern Maine
+  - given-names: Lori
+    family-names: Sussman
+    email: lori.sussman@maine.edu
+    affiliation: University of Southern Maine
+repository-code: 'https://github.com/monnin/turnstile'
+abstract: >-
+  Isolated clusters are necessary for cybersecurity
+  education, research, and testing. Hands-on cybersecurity
+  learning in isolated clusters allows cybersecurity
+  students to practice with various hacking tools and
+  develop professional cybersecurity technical skills.
+  Educators often use these remote learning environments for
+  research as well. Researchers and students use these
+  isolated environments to test sophisticated hardware,
+  software, and procedures using full-fledged operating
+  systems, networks, and applications. The isolation
+  prevents harm to networked systems. However, there are
+  times when the data is needed to move in quantities or
+  speeds, making downloading onto an intermediate device
+  untenable. This study proposes a novel turnstile model, a
+  mechanism for one-way file transfer from one enterprise
+  system to another. This system protects data integrity and
+  security by connecting the isolated environment to the
+  external network via a locked-down interconnection. Using
+  medium-security isolated clusters, the researchers
+  successfully developed a unidirectional file transfer
+  system that acts as a one-way “turnstile” for secure file
+  transfer between systems not connected to the internet or
+  other external networks. The Turnstile system (source code
+  available at github.com/monnin/turnstile) provides
+  unidirectional file transfer between two computer systems.
+  The solution enabled data to be transferred from a source
+  system to a destination system without allowing any data
+  transfer back in the opposite direction. The researchers
+  found an automated process of transferring external files
+  to isolated clusters that still optimized the transfer
+  speed of external files to isolated clusters using Linux
+  distributions and commands.
+license: CC-BY-NC-SA-4.0
