@@ -16,6 +16,7 @@ authors:
     family-names: Sussman
     email: lori.sussman@maine.edu
     affiliation: University of Southern Maine
+    orcid: https://orcid.org/0000-0003-3667-0340
 repository-code: 'https://github.com/monnin/turnstile'
 abstract: >-
   Isolated clusters are necessary for cybersecurity
