@@ -1,8 +1,11 @@
 # Turnstile - A Unidirectional System for Medium-Security Isolated Clusters
 
-## Source Code Placeholder
+Turnstile implements a secure method to copy files into an (otherwise) isolated computing cluster.  
+It uses a single USB connection between two computers (physical or virtual) and limits the the types of permitted communication 
+using a few different techniques.  While it has many use cases, it is not intended for high-security settings.
 
-This repository is currently empty.  It will have the source code for Turnstile available when the corresponding paper is published.  For now, if you need the source code for peer review, please contact Mark Monnin for access.
+For more information on the underlying protocols, please see the supporting article in the Journal of Cybersecurity Education,
+Research, and Practice: https://digitalcommons.kennesaw.edu/jcerp/vol2024/iss1/12
 
 ## License
 
