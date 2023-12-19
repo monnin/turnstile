@@ -1,0 +1,50 @@
+#
+#       This is only needed on the system that is
+#               a) Internet-facing
+#               b) Providing the UI for users to transfer files
+#
+#       1. Modify the path on the proxy_pass line
+#       2. Modify the SSL keys (if necessary) - 
+#		ssl_certificate & ssl_certificate_key
+#
+#       3. Copy this into /etc/nginx/sites-enabled
+#
+#
+server {
+        # SSL configuration
+        #
+        listen 443 ssl default_server;
+
+        server_name xfer-c.networking-lab.usm.maine.edu;
+
+        ssl_certificate /etc/ssl/private/wildcard.full-chain;
+        ssl_certificate_key /etc/ssl/private/wildcard.key;
+
+        ssl_protocols TLSv1.2;
+        root /var/www/html;
+
+        client_max_body_size 4G;
+
+        # Add index.php to the list if you are using PHP
+        index index.html index.htm index.nginx-debian.html;
+
+        #server_name _;
+
+        location / {
+		include proxy_params;
+                proxy_pass http://unix:/usr/local/turnstile/var/run/xfer.sock;
+                keepalive_timeout 1h;
+                proxy_read_timeout 1h;
+
+        }
+}
+
+server {
+	listen 80 default_server;
+	listen [::]:80 default_server;
+
+        server_name xfer.networking-lab.usm.maine.edu;
+
+	return 301 https://$host$request_uri;
+	}	
+

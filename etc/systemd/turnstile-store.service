@@ -1,0 +1,35 @@
+#
+#	This is only needed on the system that is 
+#		a) Internet-facing  
+#		b) Providing the UI for users to transfer files
+#
+#	1. Modify the path on the WorkingDirectory line
+#	2. Modify the path on the ExecStart line
+#
+#	3. Copy this into /etc/systemd/system
+#
+#	4. systemctl enable turnstile-store
+#	5. systemctl start turnstile-store
+#
+
+[Unit]
+Description=Gunicorn application server running turnstile's t-store
+After=network.target
+
+[Service]
+#User=www-data
+#Group=www-data
+User=root
+Group=root
+
+WorkingDirectory=/usr/local/turnstile/cgi
+
+ExecStart=/usr/bin/gunicorn3 --workers 10 --timeout 3600 --bind unix:/usr/local/turnstile/var/run/xfer.sock -m 000 t-store:app
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/bin/kill -s TERM $MAINPID
+
+Restart=on-failure
+RestartSec=60s
+
+[Install]
+WantedBy=multi-user.target

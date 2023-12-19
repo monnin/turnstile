@@ -1,0 +1,82 @@
+Packet Format for Commands and Responses
+
+  Commands: 
+    <cmd:8bitchar>[<path:0-511bytes]>
+
+  Responses: 
+    <resp:8bitchar><transaction-id-or-errorcode:8bitint>[<data:0-510bytes]
+
+Commands:
+
+   Since the path might take multiple packets, multiple 
+   "prefix" packets can be sent ahead of time
+
+   C<trans-id:8bitint>	- Get the next packet in a larger response
+
+   G<path> - Get a file (can use multiple "P" packets prior)
+   	(Returns an error code if the path is not a [normal] file)
+
+   K<path> - Return the destination if path is a symbolic link
+		(returns an empty packet if valid, but not a symlink)
+
+   L<path> - Perform a "ls" on a directory (nominally)
+   	If path is a directory:
+   	Returns the name (but not the full path) of all files/dirs in 
+		that dir (non-recursively)
+   	(\0 between items)
+   	If a path is a file:
+   		Returns two \0\0 if the file exists
+   	If a path is neither a file nor directory:
+   		Returns an error code	
+
+   M - Get MaxPacket (set by server or relay)
+	(returns packet size as a 32-bit number)
+
+   N[<data>] - NoOp - Does nothing on the relay/server, but has a valid 
+		response packet.  
+
+		Relay special case: If data is a NUL (or is not present),
+		then the relay answers the NoOp, otherwise it forwards the
+		request to the server (that way a client can check both 
+		entities)
+
+   Q<prio> - Set the priority of the connection 
+	(used by the relay, ignored by the server)
+
+   S<path> - Stat a file/dir - 
+      Return a (limited) stat() of a file or directory 
+	(a directory returns a single item)
+  	(Returns an error code if the path is not a file or directory)
+   	(Returns flags, mode, size, mtime, ctime) 
+		# Mode does NOT include file type
+		(flags: LSB (1) = dir, (0) = file)
+		(flags: MSB (1) = symlink, (0) = not symlink)
+
+   Z - Reset - Clears/deletes all partial transfers 
+	(aka incomplete transactions)
+
+   P<ppath> - Prefix (of a path) - Allows for paths > 511 bytes long
+   	Since the path might take multiple packets, multiple 
+	"prefix" packets can be sent ahead of actual command packet.  
+  	(e.g. P<path1>, P<path2>, G<path3> would request a "get" 
+		operation with a longerr file path)
+   
+  	Server responds with a "c" (continue) packet
+
+
+
+Reponses:
+
+   c - Continue - used only with "P" packets
+   d<id><data>	- Data packet with more data available after this packet
+   l<id>[<data>]	Data packet with no more data available 
+			(the last packet - completes the transaction)
+			(an empty data section is pemitted)
+   z<id> - Error response to command
+
+
+Turnstile over UDP:
+
+   Uses the exact same protocol but prepends an 8bit sequence #
+
+   Cmds:  <net-seq-num:8bit><cmd:8bit><trans-id:8bit>[<data...>]

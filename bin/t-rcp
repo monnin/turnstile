@@ -1,0 +1,209 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import sys
+import time
+
+sys.path.append(os.path.dirname(__file__) + "/../lib")
+
+import usbUDP
+import usbUSB1
+import usb_comm
+
+local_fd = -1
+local_filename = None
+
+num_bytes = 0
+
+def si_unit(num):
+
+    if num > 1024 ** 3:
+        num = num / (1024 ** 3)
+        s = f'{num:.1f}' + "G"
+
+    elif num > 1024 ** 2:
+        num = num / (1024 ** 2)
+        s = f'{num:.1f}' + "M"
+
+    elif num > 1024:
+        num = num / 1024
+        s = f'{num:.1f}' + "K"
+
+    else:
+        s = f'{num:.1f}'
+
+    return s
+
+#
+#----------------------------------------------------------------------
+#
+def print_time(num_bytes, num_seconds):
+
+    print("Transfered", si_unit(num_bytes) +"B",
+          "in", f'{num_seconds:.1f}' + "s", "=",
+          si_unit(8 * num_bytes / num_seconds) + "bps")
+
+
+#
+#----------------------------------------------------------------------
+#
+
+def output_block(data):
+    global local_fd
+    global num_bytes
+
+    if data is None:
+        if local_fd == -1:
+            print("File not found on remote system", file=sys.stderr)
+        else:
+            print("Communication to remote system interrupted, aborting",
+                    file=sys.stderr)
+
+        sys.exit(1)
+
+    elif local_fd == -1:
+        local_fd = os.open(local_filename,
+                           os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+
+    # Keep track of the bytes written
+    num_bytes += len(data)
+
+    os.write(local_fd, data)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Turnstile Remote Copy")
+
+    parser.add_argument("-d", "--debug", help="Level of debug info shown",
+           type=int, default=0)
+
+    parser.add_argument("-t", "--timeout",
+           help="time (in seconds) to wait for USB response",
+           default=0.3, type=float)
+
+    parser.add_argument("-u", "--use-usb",
+           action="store_true",
+           help="Use the USB port directly instead of the relay")
+
+    parser.add_argument("--product-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--vendor-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--max-trans-size", type=int, default=-1,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("-P", "--priority",
+           help="Base priority of requests (for relay only)",
+           type=int)
+
+    parser.add_argument("--port",
+           help="UDP port of the relay (def=12345)",
+           type=int, default=12345)
+
+    parser.add_argument("-i","--ip-addr",
+           help="IP address of the relay (def=localhost)",
+           default="localhost")
+
+    #
+    #   Program specific options
+    #
+
+    parser.add_argument("-p", "--preserve",
+           action="store_true",
+           help="Set the mode and mtime of local file to match the remote file")
+
+
+    parser.add_argument("-v","--verbose",
+            action="store_true",
+            help="Display the time and bandwidth used for the transfer")
+
+    parser.add_argument("-V","--verify",
+            action="store_true",
+            help="Check the SHA1 hash to verify file integrity")
+
+    parser.add_argument("remotefile", help="File on remote computer")
+
+    parser.add_argument("localfile",
+           help="File (or directory) on this computer to store file")
+
+    args = parser.parse_args()
+
+    return args
+
+def main():
+    global local_fd
+    global local_filename
+
+    args = parse_args()
+
+    if args.use_usb:
+        my_usb_obj = usbUSB1.usbUSB1(
+                            vendor_id=args.vendor_id,
+                            product_id=args.product_id)
+
+    else:
+        my_usb_obj = usbUDP.usbUDP()
+
+        if args.port is not None:
+            my_usb_obj.set_port(args.port)
+
+        if args.ip_addr is not None:
+            my_usb_obj.set_ip(args.ip_addr)
+
+    my_client = usb_comm.Client(my_usb_obj, args.timeout)
+    my_client.set_debug(args.debug)
+
+    # Use the command-line to override max-trans-size if given
+    if args.max_trans_size >= 64:
+        my_client.client_set_max_packet(args.max_trans_size)
+
+    if args.priority is not None:
+        my_client.client_set_priority(args.priority)
+
+    remote_filename = args.remotefile
+    local_filename = args.localfile
+    preserve = args.preserve
+
+    # Did we get a directory and not a filename?
+    if os.path.isdir(local_filename):
+        local_filename = local_filename + "/" + \
+                         os.path.basename(remote_filename)
+
+    before = time.time()
+    still_ok = my_client.client_get_fileCB(remote_filename, output_block)
+    after = time.time()
+
+    if local_fd != -1:
+        os.close(local_fd)
+
+    if still_ok and args.verify:
+        (res, l_hash, r_hash) = my_client.client_compare_hash_file(
+                local_filename, remote_filename)
+
+        if res != 0:
+            print("Verify failed: The resulting file has a different hash " +
+                    "than the original/remote file", file=sys.stderr)
+
+            if os.path.exists(local_filename):
+                os.remove(local_filename)
+                print("Transfer aborted", file=sys.stderr)
+
+    if still_ok and preserve:
+        data = my_client.client_stat_path(remote_filename)
+
+        if data is not None:
+            (is_dir, mode, size, mtime, ctime) = data
+
+            os.chmod(local_filename, mode)
+            os.utime(local_filename, (mtime, mtime))
+
+    if still_ok and args.verbose:
+        print_time(num_bytes, after-before)
+
+    if not still_ok:
+        print("No such remote file", file=sys.stderr)
+        sys.exit(1)
+
+main()

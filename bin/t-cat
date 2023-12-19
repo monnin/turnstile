@@ -1,0 +1,95 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import sys
+
+sys.path.append(os.path.dirname(__file__) + "/../lib")
+
+import usbUDP
+import usbUSB1
+import usb_comm
+
+def output_block(data):
+    sys.stdout.buffer.write(data)
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+           description="Turnstile - Retrieve Remote File to stdout")
+
+    parser.add_argument("-d", "--debug", help="Level of debug info shown",
+           type=int, default=0)
+
+    parser.add_argument("-t", "--timeout",
+           help="time (in seconds) to wait for USB response",
+           default=0.3, type=float)
+
+    parser.add_argument("-P", "--priority",
+           help="Base priority of requests (for relay only)",
+           type=int)
+
+    parser.add_argument("--product-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--vendor-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--max-trans-size", type=int, default=-1,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("-u", "--use-usb",
+           action="store_true",
+           help="Use the USB port directly instead of the relay")
+
+    parser.add_argument("-p", "--port",
+           help="UDP port of the relay (def=12345)",
+           type=int, default=12345)
+
+    parser.add_argument("-i","--ip-addr",
+           help="IP address of the relay (def=localhost)",
+           default="localhost")
+
+    parser.add_argument("remotefile",
+           help="File on remote computer to view/retrieve")
+
+    args = parser.parse_args()
+
+    return args
+
+
+def main():
+
+    args = parse_args()
+
+    if args.use_usb:
+        my_usb_obj = usbUSB1.usbUSB1(
+                            vendor_id=args.vendor_id,
+                            product_id=args.product_id)
+    else:
+        my_usb_obj = usbUDP.usbUDP()
+
+        if args.port is not None:
+            my_usb_obj.set_port(args.port)
+
+        if args.ip_addr is not None:
+            my_usb_obj.set_ip(args.ip_addr)
+
+    my_client = usb_comm.Client(my_usb_obj, args.timeout)
+    my_client.set_debug(args.debug)
+
+    # Use the command-line to override max-trans-size if given
+    if args.max_trans_size >= 64:
+        my_client.client_set_max_packet(args.max_trans_size)
+
+    if args.priority is not None:
+        my_client.client_set_priority(args.priority)
+
+    filename = args.remotefile
+
+    still_ok = my_client.client_get_fileCB(filename, output_block)
+
+    if still_ok == 0:
+        print("No such remote file", file=sys.stderr)
+        sys.exit(1)
+
+main()

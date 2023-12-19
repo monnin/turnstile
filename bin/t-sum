@@ -1,0 +1,175 @@
+#!/usr/bin/python3
+
+"""
+t-sum - Display a SHA512 hash for either a local or remote file.
+"""
+
+import argparse
+import datetime
+import os
+import stat
+import sys
+
+sys.path.append(os.path.dirname(__file__) + "/../lib")
+
+import usbUDP
+import usbUSB1
+import usb_comm
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+                description="Turnstile (Remote and Local) File Checksums")
+
+    #
+    #   Common turnstile options
+    #
+
+    parser.add_argument("-d", "--debug", help="Level of debug info shown",
+           type=int, default=0)
+
+    parser.add_argument("-P", "--priority",
+           help="Base priority of requests (for relay only)",
+           type=int)
+
+    parser.add_argument("-t", "--timeout",
+           help="time (in seconds) to wait for USB response",
+           default=5, type=float)
+
+    parser.add_argument("-u", "--use-usb",
+           action="store_true",
+           help="Use the USB port directly instead of the relay")
+
+    parser.add_argument("--product-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--vendor-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--max-trans-size", type=int, default=-1,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("-p", "--port",
+           help="UDP port of the relay (def=12345)",
+           type=int, default=12345)
+
+    parser.add_argument("-i","--ip-addr",
+           help="IP address of the relay (def=localhost)",
+           default="localhost")
+
+    #
+    #   Program specific options
+    #
+    sub_parsers = parser.add_subparsers(dest='command')
+
+    local_parser = sub_parsers.add_parser('local', aliases=['l', 'loc'],
+            help="Compute checksum on a file on this computer")
+
+    remote_parser = sub_parsers.add_parser('remote', aliases=['r', 'rem'],
+            help="Compute checksum on a file on the turnstile server")
+
+    compare_parser = sub_parsers.add_parser('compare',
+            aliases=['c', 'com', 'comp'],
+            help="Compare a local file against a file on the turnstile server")
+
+    local_parser.add_argument("localpath",
+            help="File on local computer")
+
+    remote_parser.add_argument("remotepath",
+            help="File on remote server")
+
+    compare_parser.add_argument("-q", "--quiet",
+            help="Do not print results - just set the exitcode",
+            action="store_true")
+
+    compare_parser.add_argument("localpath",
+            help="File on local computer")
+
+    compare_parser.add_argument("remotepath",
+            help="File on remote server")
+
+
+    args = parser.parse_args()
+
+    return (args, parser)
+
+def main():
+    (args, parser) = parse_args()
+
+    if (args.command[0] == 'r') or (args.command[0] == 'c'):
+        if args.use_usb:
+            my_usb_obj = usbUSB1.usbUSB1(
+                            vendor_id=args.vendor_id,
+                            product_id=args.product_id)
+
+        else:
+            my_usb_obj = usbUDP.usbUDP()
+
+            if args.port is not None:
+                my_usb_obj.set_port(args.port)
+
+            if args.ip_addr is not None:
+                my_usb_obj.set_ip(args.ip_addr)
+
+        my_client = usb_comm.Client(my_usb_obj, args.timeout)
+        my_client.set_debug(args.debug)
+
+        # Use the command-line to override max-trans-size if given
+        if args.max_trans_size >= 64:
+            my_client.client_set_max_packet(args.max_trans_size)
+
+        if args.priority is not None:
+            my_client.client_set_priority(args.priority)
+
+    else:
+        # Dummy client for access to common (client+server) methods only
+        my_client = usb_comm.USBComm()
+
+    if args.command is None:
+        parser.print_help()
+
+    elif args.command[0] == 'l':
+        res = my_client.compute_hash(args.localpath)
+
+        if res is None:
+            print("File not found", file=sys.stderr)
+            exit(2)
+
+        else:
+            print(res, "  local  ", args.localpath)
+
+    elif args.command[0] == 'r':
+        res = my_client.client_hash_file(args.remotepath)
+
+        if res is None:
+            print("Remote file not found", file=sys.stderr)
+            exit(2)
+
+        else:
+            print(res, "  remote  ", args.remotepath)
+
+    elif args.command[0] == 'c':
+        (res, l_hash, r_hash) = my_client.client_compare_hash_file(args.localpath, args.remotepath)
+
+        if res == 3:
+            print("Remote file not found", file=sys.stderr)
+
+        elif res == 2:
+            print("Local file not found", file=sys.stderr)
+
+        elif not args.quiet:
+            if res == 0:
+                print("Identical")
+
+            else:
+                print("Different")
+
+            print(l_hash, "  remote  ", args.localpath)
+            print(r_hash, "  remote  ", args.remotepath)
+
+        exit(res)
+
+    else:
+        print("Invalid command to t-sum given", args.command, file=sys.stderr)
+        exit(4)
+
+main()

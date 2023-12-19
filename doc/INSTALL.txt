@@ -1,0 +1,35 @@
+Turnstile is designed to not need many external dependencies.
+
+SERVER:
+
+1. Extract the entire contents of the .tar file into a directory (e.g. /usr/local/turnstile)
+
+   (e.g.  cd /usr/local; sudo tar xfp /tmp/turnstile.tar)
+
+2. Make sure that the USB OTG port is configured within the O/S.  On a Raspberry Pi, the command is often:
+
+	dtoverlay dcw2
+
+3. Turnstile will automatically load the module for "gadgetfs" if necessary, but if you wish to use
+   FunctionFS/ConfigFS, you will need to load the module and create the directory.
+
+
+BOOTSTRAPPING the CLIENT:
+
+Only two files should be necessary to be transferred to the client ahead of time.   The turnstile source code
+(aka "turnstile.tar") and the Python3 module to support libusb1 (which is often called python3-usb1).
+
+1. For a Debian-based system (e.g. Raspbian or Ubuntu), prestage the appropriate .deb file for python3-usb1 for
+your specific distribution.
+
+2. Pre-stage turnstile.tar onto the system and install it into a directory (e.g. /usr/local/turnstile)
+
+3. Install the python3-usb1.deb file using the "dpkg -i" command
+
+4. You do not need to install the dtoverlay, nor do you need to install gadetfs, configfs, or functionfs 
+(those are only needed on the server)
+
+
+5. The base client should now be functional, although you will need additional modules for the web front end (e.g. "flask")
+You can now use the "t-rcp -u" and "t-ls -u" commands to copy any other files you need.
+

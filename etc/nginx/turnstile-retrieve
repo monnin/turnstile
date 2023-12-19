@@ -1,0 +1,37 @@
+#
+#       This is only needed on the system that is
+#               a) Internet-facing
+#               b) Providing the UI for users to transfer files
+#
+#       1. Modify the path on the proxy_pass line
+#       2. Modify the SSL keys (if necessary) - 
+#		ssl_certificate & ssl_certificate_key
+#
+#       3. Copy this into /etc/nginx/sites-enabled
+#
+#
+server {
+        # SSL configuration
+        #
+        listen 99.2.0.14:443 ssl default_server;
+        listen 99.2.0.14:80 default_server;
+
+        server_name xfer.cares;
+
+        ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
+        ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+
+        ssl_protocols TLSv1.2;
+        root /var/www/html;
+
+        # Add index.php to the list if you are using PHP
+        index index.html index.htm index.nginx-debian.html;
+
+        #server_name _;
+
+        location / {
+		include proxy_params;
+                proxy_pass http://unix:/usr/local/turnstile/var/run/xfer.sock;
+        }
+}
+

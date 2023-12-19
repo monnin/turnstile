@@ -1,0 +1,8 @@
+#
+#	Sample script to start the server
+#	(add to rc.local or other place)
+#
+dtoverlay dwc2
+modprobe gadgetfs
+(cd /usr/local/turnstile/sbin; sh restart.sh ./t-server > /tmp/server.log) 2>&1  &
+

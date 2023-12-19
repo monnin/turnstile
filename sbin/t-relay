@@ -1,0 +1,584 @@
+#!/usr/bin/python3
+
+#
+#   Turnstile USB Transfer Relay
+#       (located in the isolated cluster and cabled to the USB Transfer Server)
+#
+#
+
+
+import argparse
+import os
+import queue
+import shlex
+import socket
+import sys
+import threading
+import time
+
+sys.path.append(os.path.dirname(__file__) + "/../lib")
+
+import usbUSB1
+import usb_comm
+
+#
+#   priorities (lower = better)
+#
+#   N noop (handled internally)
+#   M MaxPacket (handled internally)
+#   Z reset +0
+#   S stat  +1
+#   L list dir +2
+#   C continue +3
+#   G get +4
+#   H hash +5
+#
+#   Q prio (handled internally & immediately)
+#
+#
+
+DEF_PRIORITY = 100
+
+DEBUG = 4
+
+MAX_REMOTE_SYS = 64
+MAX_REMOTE_SYS_AGE = 5 * 60     # In seconds
+
+EMPTY_DATA_RESPONSE = b"l\0"
+
+usb_worker_thread = None
+netsend_worker_thread = None
+cleanup_worker_thread = None
+
+all_workers_stop = False
+
+usb_worker_queue = queue.PriorityQueue()
+netsend_worker_queue = queue.Queue()
+
+trans_id2remote_sys = {}
+remote_sys_db = {}
+
+my_client = None
+
+udp_socket = None
+
+
+class remoteSysEntry:
+    def __init__(self):
+        self.priority = DEF_PRIORITY
+        self.last_access = time.time()
+        self.last_sent = None
+        self.last_recv = None
+        self.my_seq_num = 1
+#
+#----------------------------------------------------------------------
+#
+      
+def print_debug(level, *args, **kwargs):
+    if DEBUG >= level:
+        print(*args,**kwargs)
+
+
+#
+#----------------------------------------------------------------------
+#
+      
+def usb_worker():
+    print_debug(1,"Starting USB communication thread")
+
+
+    while (not all_workers_stop):
+        try:
+            data = usb_worker_queue.get(timeout=1.0)
+
+        except queue.Empty:
+            data = None
+
+        if data is not None:
+            (prio, remote_sys, packet) = data
+
+            print_debug(2, "Sending request to USB from", remote_sys)
+
+            response = my_client.send_and_receive_packet(packet)
+
+            print_debug(4, "USB response was", response)
+
+            resp_code = response[0]
+            trans_id = response[1]
+
+            # Is this part of a data transaction?
+            #  (if so, then update trans_id2remote_sys)
+
+            if trans_id != b"\0":
+
+                # Is this the last packet in the transaction?
+                #  if so, free up the transaction match
+                if resp_code == b"l":
+                    del trans_id2remote_sys[trans_id]
+
+                else:
+                    # Keep track of this (unfinished) transaction
+                    trans_id2remote_sys[trans_id] = remote_sys
+
+            # Now send the packet on the way
+            queue_udp_response(remote_sys, response)
+
+    print_debug(1,"USB communication thread ended")
+
+#
+#----------------------------------------------------------------------
+#
+
+def netsend_worker():
+    print_debug(1,"Starting UDP sending thread")
+
+    while (not all_workers_stop):
+        try:
+            data = netsend_worker_queue.get(timeout=1.0)
+
+        except queue.Empty:
+            data = None
+
+
+        if data is not None:
+            (dest, packet) = data
+
+            print_debug(4, "Sending UDP packet to", dest, len(packet))
+
+            (host_ip, host_port) = dest.split(":", 1)
+            host_port = int(host_port)
+
+            udp_socket.sendto(packet, (host_ip, host_port))
+
+
+    print_debug(1,"NetSend worker thread ended")
+#
+#----------------------------------------------------------------------
+#
+
+def queue_udp_response(remote_sys, packet):
+    print_debug(4, "Queueing UDP packet to", remote_sys)
+
+    # Add the sequence number to the outgoing packet
+    seq_num = remote_sys_db[remote_sys].my_seq_num
+    packet = seq_num.to_bytes(1, 'little') + packet
+
+    # Now update the sequence number
+    seq_num = (seq_num + 1) % 256
+    remote_sys_db[remote_sys].my_seq_num = seq_num
+
+    # Store the last message (if retransmission is necessary)
+    remote_sys_db[remote_sys].last_sent = packet
+
+    netsend_worker_queue.put((remote_sys, packet))
+#
+#----------------------------------------------------------------------
+#
+def remote_one_sys(sys):
+    print_debug(4,"Removing stale system", sys)
+
+    del remote_sys_db[sys]
+
+    # Now remove any uncompleted transactions
+    for trans in list(trans_id2remote_sys):
+        if trans_id2remote_sys[trans] == sys:
+            print_debug(4,"Removing stale transaction", sys, trans)
+            del trans_id2remote_sys[trans]
+
+def cleanup_now():
+    print_debug(4, "Cleaning up old cache entries")
+
+    now = time.time()
+    too_old = now - MAX_REMOTE_SYS_AGE
+
+    oldest_sys = None
+    oldest_time = None
+
+    done = False
+
+    while (not done):
+
+        # Use list() to permit removing items in the loop
+        for sys in list(remote_sys_db):
+
+            # Remove any systems that haven't communicated in a while
+            if remote_sys_db[sys].last_access < too_old:
+                remote_one_sys(sys)
+
+            # Keep track of the oldest [alive] system (for forced deletion)
+            elif oldest_sys is None:
+                oldest_sys = sys
+                oldest_time = remote_sys_db[sys].last_access
+
+            elif oldest_time > remote_sys_db[sys].last_access:
+                oldest_sys = sys
+                oldest_time = remote_sys_db[sys].last_access
+
+        if len(remote_sys_db) > MAX_REMOTE_SYS:
+            remove_old_sys(oldest_sys)
+        else:
+            done = True
+
+
+def cleanup_worker():
+    print_debug(1,"Starting DB cleanup thread")
+
+    next_cleanup_time = 0   # This will force a cleanup initially, but that's
+                            # OK
+
+    while (not all_workers_stop):
+        now = time.time()
+
+        if now > next_cleanup_time:
+            cleanup_now()
+
+            next_cleanup_time = now + 2 * 60    # cleanup every 2 minutes
+
+        time.sleep(1)       # Sleep for one second (allow for early temination)
+
+
+    print_debug(1,"DB Cleanup worker thread ended")
+#
+#
+#----------------------------------------------------------------------
+#
+
+      
+#
+#   priorities (lower = better)
+#
+#   N noop +0
+#   Z reset +0
+#   S stat  +1
+#   L list dir +2
+#   C continue +3
+#   G get +4
+#   H hash +5
+#
+#   Q prio (handled internally)
+#
+#
+
+def get_priority(remote_sys, packet):
+
+    cmd = chr(packet[0])
+
+    base_priority = remote_sys_db[remote_sys].priority
+
+    if (cmd == "Z") or (cmd == "N"):
+        penalty = 0
+    elif cmd == "S":
+        penalty = 1
+    elif (cmd == "L") or (cmd == "K"):
+        penalty = 2
+    elif cmd == "C":
+        penalty = 3
+    elif cmd == "G":
+        penalty = 4
+    elif cmd == "H":
+        penalty = 5
+    else:
+        print("Warning: packet from", remote_sys,
+              "had invalid command", cmd, file=sys.stderr)
+        base_priority = -1
+        penalty = -1
+
+    return base_priority + penalty
+
+def store_priority(remote_sys, new_prio):
+    if new_prio < 1:
+        new_prio = 1
+  
+    remote_sys_db[remote_sys].priority = new_prio
+  
+
+
+#
+#----------------------------------------------------------------------
+#
+def store_remote_sys_info(remote_sys, packet):
+    handled_internally = False
+
+    # Add it if not already in the DB
+    if remote_sys not in remote_sys_db:
+        remote_sys_db[remote_sys] = remoteSysEntry()
+
+    remote_sys_db[remote_sys].last_access = time.time()
+
+    # Retransmission?  If so, just resend the cached response
+    if packet == remote_sys_db[remote_sys].last_recv:
+        handled_internally = True
+
+        queue_udp_response(remote_sys,
+                           remote_sys_db[remote_sys].last_sent)
+
+
+    return handled_internally
+
+def check_trans_id(remote_sys, packet):
+    still_ok = 1
+
+    # Is this packet a "continue" packet?
+    # Does this packet have a transaction id?
+    if (len(packet) > 1) and (packet[0] == b"C"):
+        trans_id = packet[1]
+
+        # Is this a someone else's transaction?  If so,
+        #  then do not permit this packet to go
+
+        if (trans_id != 0) and \
+                (trans_id2remote_sys[trans_id] != remote_sys):
+            still_ok = 0
+
+        # No fair "C" without a transaction #
+        elif (len(packet) == 1) and (packet[0] == b"C"):
+            still_ok = 0
+
+    return still_ok
+
+#
+#----------------------------------------------------------------------
+#
+def queue_usb_request(remote_sys, packet):
+    still_ok = check_trans_id(remote_sys, packet)
+
+    if still_ok:
+        prio = get_priority(remote_sys, packet)
+
+    # Ignore negative priorities (indicates invalid packet)
+    if still_ok and (prio >= 0):
+        print_debug(3,"Queued request, prio", prio,
+                    "from", remote_sys)
+
+        usb_worker_queue.put((prio, remote_sys, packet))
+#
+#----------------------------------------------------------------------
+#
+
+def handle_net_requests(ourMaxPacket):
+
+    while True:
+        try:
+            # Yes, this is larger than max pack
+            data = udp_socket.recvfrom(65535) 
+
+        except KeyboardInterrupt:
+            print("Exiting due to receiving a ^C from the keyboard",
+                    file=sys.stderr)
+            sys.exit(0)
+
+        if data is None:
+            pass        # Ignore any timeouts
+        elif len(data) > ourMaxPacket:
+            pass        # Ignore jumbo frames
+        else:
+            (packet, addr_tuple) = data
+            packet_len = len(packet)
+
+            #
+            # Did we get any data at all?  If so, then process it
+            #
+            if data is not None:
+                remote_sys = addr_tuple[0] + ":" + str(addr_tuple[1])
+
+                if packet_len > 0:
+                    handled_internally = store_remote_sys_info(remote_sys,
+                                                               packet)
+
+                    # No more need for the seq number - remove it
+                    packet = packet[1:]
+                    packet_len = len(packet)
+
+                    cmd = chr(packet[0])
+
+                    if handled_internally:
+                        pass        # Ignore retransmissions
+
+                    # Handle priority changes right now
+                    #  (no need to queue them)
+                    elif cmd == "Q":
+                        new_prio = packet[1]
+
+                        store_priority(remote_sys, new_prio)
+                        queue_udp_response(remote_sys, EMPTY_DATA_RESPONSE)
+
+                    # Handle the packet size request locally
+                    elif cmd == "M":
+                        max_packet = my_client.max_packet.to_bytes(4, 'little')
+                        queue_udp_response(remote_sys, b"l\0" + max_packet)
+
+                    # Handle NOOP locally (if no data or a "\0")
+                    elif cmd == "N":
+
+                        # Do we handle this ourselves?
+                        if packet_len < 2:
+                            queue_udp_response(remote_sys, EMPTY_DATA_RESPONSE)
+
+                        elif packet[1] == 0:
+                            queue_udp_response(remote_sys, EMPTY_DATA_RESPONSE)
+
+                        else:
+                            queue_usb_request(remote_sys, packet)
+
+                    else:
+                        queue_usb_request(remote_sys, packet)
+#
+#----------------------------------------------------------------------
+#
+def init_socket(addr, port):
+    global udp_socket
+
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    udp_socket.bind((addr, port))
+    #udp_socket.settimeout(5)      # 5 seconds wait for incoming messages
+
+
+#
+#----------------------------------------------------------------------
+#
+def read_config(parser, args, filename, silent_fail):
+    print_debug(4, "Reading config", filename)
+
+    if os.path.exists(filename):
+        f = open(filename)
+        for line in f:
+            line_parts = shlex.split(line, comments=True)
+            line_len = len(line_parts)
+
+            # Non-empty line?
+            if line_len > 0:
+                keyword = line_parts[0]
+
+                if keyword in args:
+                    val = line_parts[1]
+
+                    if line_len > 1:
+                        val     = " ".join(line_parts[1:])
+                    else:
+                        val = None
+
+
+                    # Follow the data-type of the original item
+                    if type(args[keyword]) is int:
+                        val = int(val)
+
+                    if type(args[keyword]) is bool:
+                        val = True
+
+                    parser.set_defaults( ** { keyword : val } )
+
+                else:
+                    print("Unrecognized keyword \"" + cmd +
+                            "\" in file", filename, "(ignored)")
+
+    elif not silent_fail:
+        print("Warning: Could not open \"" + filename + "\"", file=sys.stderr)
+
+
+#
+#----------------------------------------------------------------------
+#
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+                description="Turnstile Relay Agent")
+
+    parser.add_argument("--config", action="append", default=[],
+           help="Optional configuration file")
+
+    parser.add_argument("-d", "--debug", help="Level of debug info shown",
+           type=int, default=0)
+
+    parser.add_argument("--product-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--vendor-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--max-trans-size", type=int, default=-1,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("-t", "--timeout",
+           help="time (in seconds) to wait for USB response",
+           default=20.0, type=float)
+
+    parser.add_argument("-p", "--port",
+           help="UDP Port to listen on (def=12345)",
+           type=int, default=12345)
+
+    parser.add_argument("-i","--ip-addr",
+           help="IP address to listen on (def=localhost)",
+           default="localhost")
+
+    args = parser.parse_args()
+
+    if len(args.config) == 0:
+        allow_list = read_config(parser, vars(args),
+                os.path.dirname(__file__) + "/../etc/relay.conf", True)
+    else:
+        for filename in args.config:
+            allow_list.extend(read_config(parser, vars(args), filename, False))
+
+    args = parser.parse_args()
+
+
+    return args
+
+#
+#----------------------------------------------------------------------
+#
+
+def main():
+    global my_client
+    global DEBUG
+
+    args = parse_args()
+
+    toUSB = usbUSB1.usbUSB1(
+            vendor_id=args.vendor_id,
+            product_id=args.product_id)
+
+    my_client = usb_comm.Client(toUSB, args.timeout)
+    my_client.set_debug(args.debug)
+    DEBUG = args.debug
+
+    # Use the command-line to override max-trans-size if given
+    if args.max_trans_size >= 64:
+        my_client.client_set_max_packet(args.max_trans_size)
+
+    init_socket(args.ip_addr, args.port)
+
+    all_workers_stop = False
+
+    usb_worker_thread = threading.Thread(target=usb_worker)
+    netsend_worker_thread = threading.Thread(target=netsend_worker)
+    cleanup_worker_thread = threading.Thread(target=cleanup_worker)
+
+    # Make the threads die with the parent
+    usb_worker_thread.daemon = True
+    netsend_worker_thread.daemon = True
+    cleanup_worker_thread.daemon = True
+
+    # Fire them up
+    usb_worker_thread.start()
+    netsend_worker_thread.start()
+    cleanup_worker_thread.start()
+
+    max_packet = my_client.client_get_max_packet()
+    my_client.client_set_max_packet(max_packet)
+
+    print_debug(1, "Using a MaxPacket size of", max_packet)
+
+    handle_net_requests( max_packet )
+
+
+    if usb_worker_thread is not None:
+        usb_worker_thread.join(timeout=1)  # Wait for thread to stop - 1s
+
+    if netsend_worker_thread is not None:
+        netsend_worker_thread.join(timeout=1)  # Wait for thread to stop - 1s
+
+
+main()

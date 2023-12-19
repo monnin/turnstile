@@ -1,0 +1,552 @@
+#!/usr/bin/python3
+
+import argparse
+import datetime
+import os
+import shutil
+import sys
+import time
+
+sys.path.append(os.path.dirname(__file__) + "/../lib")
+
+import usbUDP
+import usbUSB1
+import usb_comm
+
+DEF_MAX_DEPTH = 15
+
+local_fd = -1
+file_len = 0
+
+log_level = 0
+
+def print_log(level, *args, **kwargs):
+    if log_level >= level:
+        print(*args,**kwargs)
+
+def output_block(data):
+    global local_fd
+    global file_len
+
+    os.write(local_fd, data)
+
+    file_len = file_len + len(data)
+
+
+def stat_is_diff(r_stat, l_stat, key, allow_diff = 0):
+    result = 0
+
+    if l_stat is None:
+        result = 1
+
+    else:
+        diff = abs(l_stat[key] - r_stat[key])
+
+        if diff > allow_diff:
+            result = 1
+
+    return result
+
+def chmod_if_necesssary(local_path, r_stat, l_stat, args):
+    still_ok = 1
+
+    make_change = stat_is_diff(r_stat, l_stat, "mode")
+
+    if make_change:
+        new_mode = r_stat["mode"]
+
+        if args.show_commands:
+            print_log(0, "% chmod", oct(new_mode)[2:], local_path)
+
+        if not args.dry_run:
+            try:
+                os.chmod(local_path, new_mode)
+
+            except Exception as my_except:
+                print("Warning: chmod", local_path, "failed", file=sys.stderr)
+                still_ok = 0
+
+    return still_ok
+
+def chdate_if_necesssary(local_path, r_stat, l_stat, args):
+    still_ok = 1
+
+    # Allow for a 3 second diff between the two files
+    make_change = stat_is_diff(r_stat, l_stat, "mtime", 3)
+
+    # Don't change date if a directory
+    if (l_stat is not None) and (l_stat["is_dir"]):
+        make_change = 0
+
+    if (r_stat is not None) and (r_stat["is_dir"]):
+        make_change = 0
+
+    if make_change:
+
+        mtime = r_stat["mtime"]
+
+        if args.show_commands:
+            print_log(0, "% touch -d \"@" + str(mtime) + "\" " +  local_path,
+                    "! update mtime/atime")
+
+        if not args.dry_run:
+            try:
+                os.utime(local_path, (mtime, mtime))
+
+            except Exception as my_except:
+                print("Warning: os.utime", local_path, "failed",
+                      file=sys.stderr)
+
+                still_ok = 0
+
+    return still_ok
+
+
+def mkdir_if_necessary(local_path, r_stat, l_stat, args):
+    still_ok = 1
+
+    # Allow for a file to be replaced with a directory
+    if (l_stat is not None) and (not l_stat["is_dir"]):
+        if l_stat["is_file"]:
+
+            if args.show_commands:
+                print_log(0, "% rm", local_path,
+                        "! remove file before create dir")
+            else:
+                print_log(3, "Removing old",local_path,"before creating dir")
+
+            if not args.dry_run:
+                try:
+                    os.remove(local_path)
+                except Exception as my_except:
+                    print("Error: rm", local_path, "failed")
+                    # still_ok = 0
+                    sys.exit(1)
+        else:
+            #still_ok = 0
+            print("Error: Non-Dir, Non-File", local_path, "cannot process",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    # Create the dir if not there
+    #  (at this point, the path is either an existing dir or nothing)
+    if (still_ok) and (not os.path.exists(local_path)):
+        if args.show_commands:
+            print_log(0, "% mkdir", local_path)
+
+        if not args.dry_run:
+            try:
+                os.mkdir(local_path)
+
+            except Exception as my_except:
+                print("Error: mkdir", local_path, "failed", file=sys.stderr)
+                sys.exit(1)
+                #still_ok = 0
+
+    if still_ok:
+        still_ok = chmod_if_necesssary(local_path, r_stat, l_stat, args)
+
+    return still_ok
+
+def si_unit(num, whole_small_nums=False):
+
+    if num > 1024 ** 3:
+        num = num / (1024 ** 3)
+        s = f'{num:.1f}' + "G"
+
+    elif num > 1024 ** 2:
+        num = num / (1024 ** 2)
+        s = f'{num:.1f}' + "M"
+
+    elif num > 1024:
+        num = num / 1024
+        s = f'{num:.1f}' + "K"
+
+    elif whole_small_nums:
+        s = str(num)
+
+    else:
+        s = f'{num:.1f}'
+
+    return s.rjust(7)   # Largest is nnnn.nC   (since 1023.9 < cutoff)
+
+def print_time(filename, num_bytes, num_seconds, args):
+    if len(filename) > 45:
+        filename = "..." + filename[-42:]
+    else:
+        filename = filename.ljust(45)
+
+    print_log(1, filename, ":",
+              si_unit(num_bytes, True) +"B",
+              f'{num_seconds:6.2f}' + "s",
+              si_unit(8 * num_bytes / num_seconds) + "bps"
+              )
+
+#
+#   safe_copy_remote
+#
+#       Copy the file using the following steps
+#
+#           1. Delete on temp file if present
+#           2. Copy into a ".new" file
+#           3. Rename ".new" file into real name
+#
+
+def safe_copy_remote(local_path, remote_path, my_client, args):
+    global local_fd
+    global file_len
+
+    still_ok = 1
+
+    # Create a "unique" name for the temp file
+
+    # https://stackoverflow.com/questions/10501247/best-way-to-generate-random-file-names-in-python
+    temp_name = local_path + ".new." + \
+        datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # If there is a partial existing download - (silently) delete it first
+
+    if os.path.isfile(temp_name):
+        os.remove(temp_name)
+
+    # Now copy into the .new file
+    local_fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    if local_fd != -1:
+
+        file_len = 0
+        start_time = time.time()
+
+        still_ok = my_client.client_get_fileCB(remote_path, output_block)
+
+        end_time = time.time()
+
+        os.close(local_fd)
+        local_fd = -1
+
+        print_time(remote_path, file_len, end_time - start_time, args)
+
+
+    else:
+        still_ok = 0
+
+    if still_ok and args.verify:
+        (res, l_hash, r_hash) = my_client.client_compare_hash_file(
+                temp_name, remote_path)
+
+        if res != 0:
+            print("Verify failed: ", local_path, "has a different hash " +
+                    "than remote file", remote_path, file=sys.stderr)
+            still_ok = 0
+
+    # Now move the file into the "correct" path
+    #  (or remove it if not "OK")
+
+    if still_ok:
+        os.replace(temp_name, local_path)
+
+    elif os.path.exists(temp_name):
+        os.remove(temp_name)
+
+
+    return still_ok
+
+
+def copy_file_if_necessary(local_path, remote_path,
+                           r_stat, l_stat,
+                           my_client, args):
+    still_ok = 1
+
+    # Don't override a dir/link/device with a file
+    if (l_stat is not None) and (not l_stat["is_file"]):
+        print("Error: found an existing non-file", local_path, file=sys.stderr)
+        sys.exit(1)
+
+    diff_size  = stat_is_diff(r_stat, l_stat, "size")
+    diff_mtime = stat_is_diff(r_stat, l_stat, "mtime", 3)
+
+    if diff_size or diff_mtime:
+        if args.show_commands:
+            print_log(0, "% t-rcp", remote_path, local_path)
+
+        if not args.dry_run:
+            still_ok = safe_copy_remote(local_path, remote_path, my_client, args)
+
+            if still_ok:
+                # Update the stat info
+                l_stat = my_client.client_local_stat_pathToDict(local_path)
+
+        # Change the mtime/atime of the file to match
+        if still_ok:
+            still_ok = chdate_if_necesssary(local_path, r_stat,
+                                      l_stat, args)
+
+    # Change the mode of the file to match the remote file
+    if still_ok:
+        still_ok = chmod_if_necesssary(local_path, r_stat, l_stat, args)
+
+    return still_ok
+
+def remove_old_local(full_local_path, l_stat, args):
+    still_ok = 1
+
+    if l_stat is None:
+        pass        # No need to delete a non-existing entity
+
+    elif (l_stat["is_file"]) or (l_stat["is_symlink"]):
+        print_log(3, "% rm", full_local_path)
+
+        os.remove(full_local_path)
+
+    elif args.force_delete:
+        print_log(2, "% rm -r", full_local_path)
+        shutil.rmtree(full_local_path)
+
+    else:
+        print("Warning! Wanting to replace a directory with a non-directory",
+                full_local_path, file=sys.stderr)
+        still_ok = 0
+
+    return still_ok
+
+def recursively_copy_helper(remote_dir, local_dir,
+        r_stat, l_stat, args, my_client, depth=0):
+
+    print_log(2, "Working on (remote) dir", remote_dir)
+
+    still_ok = 1
+    all_local_files = []
+
+    # Step 1 - Create the local directory if necessary
+    still_ok = mkdir_if_necessary(local_dir, r_stat, l_stat, args)
+
+    # Step 2 - Get a list of all local files (if dir exists)
+    if l_stat is not None:
+        all_local_files = os.listdir(local_dir)
+
+    all_remote_files = my_client.client_ls(remote_dir, dir_only=True)
+
+    # Go over all files in the directory
+    #  (recursively go through any sub directories)
+    #  (sort it so that it makes more "sense" to a user watching the output)
+
+    all_remote_files.sort()
+
+    for one_item in all_remote_files:
+        full_remote_path = remote_dir + "/" + one_item
+        full_local_path  = local_dir + "/" + one_item
+
+        l_stat = my_client.client_local_stat_pathToDict(full_local_path)
+        r_stat = my_client.client_stat_pathToDict(full_remote_path)
+
+        # Keep track of local files (to remove extra files)
+        if one_item in all_local_files:
+            all_local_files.remove(one_item)
+
+        if r_stat is None:
+            print("! Warning", full_remote_path, "went away - ignoring")
+
+        elif r_stat["is_symlink"]:
+            old_dest = ""
+            remote_dest = my_client.client_get_symlink(full_remote_path)
+
+            if os.path.islink(full_local_path):
+                old_dest = os.readlink(full_local_path)
+
+            # Do we need to change it?
+            if remote_dest != old_dest:
+                still_ok = 1
+
+                if l_stat is not None:
+                    still_ok = remove_old_local(full_local_path, l_stat, args)
+
+                if still_ok:
+                    print_log(3, "% ln -s", remote_dest, full_local_path)
+
+                    os.symlink(remote_dest, full_local_path)
+
+        elif r_stat["is_dir"]:
+            still_ok = mkdir_if_necessary(full_local_path, r_stat, l_stat, args)
+
+            # If dir, then go into it
+            if still_ok:
+                if depth < args.max_depth:
+                    still_ok = recursively_copy_helper(full_remote_path,
+                                      full_local_path,
+                                      r_stat, l_stat,
+                                      args, my_client,
+                                      depth+1)
+                else:
+                    print("! Warning, max_depth reached for", full_local_path)
+
+        else:
+            still_ok = copy_file_if_necessary(full_local_path,
+                           full_remote_path, r_stat, l_stat, my_client, args)
+
+    # Only delete if the "--no-delete" option is not set
+    if not args.no_delete:
+
+        # Remove any extra files left
+        #  (sort it so that it makes more "sense" to a user watching the output)
+        all_local_files.sort()
+
+        for one_item in all_local_files:
+
+            full_local_path  = local_dir + "/" + one_item
+
+            l_stat = my_client.client_local_stat_pathToDict(full_local_path)
+            if l_stat["is_file"]:
+                print_log(1, "% rm", full_local_path, "! extra file")
+
+                if not args.dry_run:
+                    try:
+                        os.remove(full_local_path)
+
+                    except Exception as my_except:
+                        print("! Warning: remove", full_local_path, "failed")
+
+            elif l_stat["is_dir"]:
+                if args.force_delete:
+                    print_log(1, "% rm -r", full_local_path)
+
+                    shutil.rmtree(full_local_path)
+                else:
+                    print("%! should remove extra subdirectory", full_local_path)
+
+            else:
+                print("! Warning: Non-File/Non-Dir", full_local_path,"ignoring")
+
+    return still_ok
+
+#
+#   small wrapper to prevent two (remote) stat() for the directory
+#   when called recursively
+#
+def recursively_copy(remote_dir, local_dir, args, my_client, depth=0):
+    l_stat = my_client.client_local_stat_pathToDict(local_dir)
+    r_stat = my_client.client_stat_pathToDict(remote_dir)
+
+    return recursively_copy_helper(remote_dir, local_dir,
+                            r_stat, l_stat,
+                            args, my_client, depth)
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+                      description="Turnstile Mirror Remote Directory")
+
+    parser.add_argument("-d", "--debug", help="Level of debug info shown",
+           type=int, default=0)
+
+    parser.add_argument("-t", "--timeout",
+           help="time (in seconds) to wait for USB response",
+           default=30.0, type=float)
+
+    parser.add_argument("-P", "--priority",
+           help="Base priority of requests (for relay only) (def=200)",
+           type=int, default=200)
+
+    parser.add_argument("-u", "--use-usb",
+           action="store_true",
+           help="Use the USB port directly instead of the relay")
+
+    parser.add_argument("--product-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--vendor-id", type=int, default=0xca7e,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("--max-trans-size", type=int, default=-1,
+           help=argparse.SUPPRESS)
+
+    parser.add_argument("-p", "--port",
+           help="UDP port of the relay (def=12345)",
+           type=int, default=12345)
+
+    parser.add_argument("-i","--ip-addr",
+           help="IP address of the relay (def=localhost)",
+           default="localhost")
+
+
+    parser.add_argument("--dry-run",
+           action="store_true",
+           help="Only show the changes, but do not execute the steps")
+
+    parser.add_argument("-f", "--force-delete",
+           action="store_true",
+           help="Allow for local directories to be overriden by files/links")
+
+    parser.add_argument("-n", "--no-delete",
+           action="store_true",
+           help="Do not delete extra files on local directory")
+
+    parser.add_argument("-l", "--log-level", help="Level of logging info shown",
+           type=int, default=2)
+
+    parser.add_argument("-m", "--max-depth",
+           help="Maximum depth of remote tree to traverse",
+           type=int, default=DEF_MAX_DEPTH)
+
+    parser.add_argument("-V","--verify",
+           action="store_true",
+           help="Check the SHA1 hash to verify file integrity")
+
+    parser.add_argument("--show-commands",
+            help="Show the equivalent command being executed",
+            action="store_true")
+
+    parser.add_argument("remotedir", help="Directory on remote computer")
+
+    parser.add_argument("localdir",
+           help="Directory on this computer to store files")
+
+    args = parser.parse_args()
+
+    # Force --show-commands for dry_run
+    if args.dry_run:
+        args.show_commands = True
+
+    return args
+
+def main():
+    global log_level
+
+    args = parse_args()
+
+    # Force a minimum level of logging for dry runs
+    if (args.dry_run) and (args.log_level < 2):
+        args.log_level = 2
+
+    log_level = args.log_level
+
+    if args.use_usb:
+        my_usb_obj = usbUSB1.usbUSB1(
+                            vendor_id=args.vendor_id,
+                            product_id=args.product_id)
+
+    else:
+        my_usb_obj = usbUDP.usbUDP()
+
+        if args.port is not None:
+            my_usb_obj.set_port(args.port)
+
+        if args.ip_addr is not None:
+            my_usb_obj.set_ip(args.ip_addr)
+
+    my_client = usb_comm.Client(my_usb_obj, args.timeout)
+    my_client.set_debug(args.debug)
+
+    # Use the command-line to override max-trans-size if given
+    if args.max_trans_size >= 64:
+        my_client.client_set_max_packet(args.max_trans_size)
+
+    if args.priority is not None:
+        my_client.client_set_priority(args.priority)
+
+    remote_dir = args.remotedir
+    local_dir = args.localdir
+
+    if args.dry_run:
+        print("%! dry_run - commands shown, but not executed")
+
+    still_ok = recursively_copy(remote_dir, local_dir, args, my_client)
+
+main()

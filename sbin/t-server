@@ -1,0 +1,1129 @@
+#!/usr/bin/python3
+
+#
+#   Turnstile USB Transfer Server
+#       (located on the external/Internet-facing side of the path)
+#
+#
+
+#
+#   Some USB code ideas taken from:
+#
+#       https://blog.soutade.fr/post/2016/07/create-your-own-usb-gadget-with-gadgetfs.html
+#       https://github.com/torvalds/linux/blob/master/tools/usb/ffs-test.c
+#       https://github.com/viveris/uMTP-Responder
+#
+#
+
+import argparse
+import ctypes
+import fcntl
+import os
+import select
+import shlex
+import subprocess
+import sys
+import threading
+
+sys.path.append(os.path.dirname(__file__) + "/../lib")
+
+# apt install python3-libusb1
+import usb1
+
+import mygadgetfs
+import myfunctionfs
+import mylibusb1
+
+import usbOSIf
+import usb_comm
+
+DEBUG = 4
+
+CONFIG_VALUE = 2
+
+CONFIGFS_DIRNAME = "turnstile_dev"
+FFS_DIRNAME = "ffs.1"
+
+GADGET_USB_EPIN  = "/dev/gadgetfs/ep1in"
+#GADGET_USB_EPOUT  = "/dev/gadgetfs/ep2out"
+GADGET_USB_EPOUT  = "/dev/gadgetfs/ep1out"
+FUNCFS_USB_EPIN   = "/dev/" + FFS_DIRNAME + "/ep1"
+FUNCFS_USB_EPOUT  = "/dev/" + FFS_DIRNAME + "/ep2"
+
+
+CONFIGFS_DIRNAME = "turnstile_dev"
+
+_STRINGID_MANUFACTURER = 1
+_STRINGID_PRODUCT = 2
+_STRINGID_SERIAL = 3
+_STRINGID_CONFIG_HS = 4
+_STRINGID_CONFIG_LS = 5
+_STRINGID_INTERFACE= 6
+_STRINGID_MAX = 7
+
+thread_fd_in  = -1
+thread_fd_out = -1
+thread_stop   = 0
+io_thread     = None
+
+allow_list    = []
+
+# The following was not defined in usb1
+# (taken from /usr/include/linux/usb/ch9.h
+USB_CONFIG_ATT_ONE        = (1 << 7)   # must be set
+USB_CONFIG_ATT_SELFPOWER  = (1 << 6)   #   self powered
+
+
+dev_strings = [ "USM-CARES", "Turnstile Gadget", "v2.0.1g",
+                "High speed configuration", "Low speed configuration",
+                "Turnstile Interface", "" ]
+
+
+ep_descriptor_in  = None
+ep_descriptor_out = None
+
+#
+#----------------------------------------------------------------------
+#
+
+def show_raw_bytes(b, title=""):
+    if title != "":
+        title = title + ": "
+
+    print(title + "Count = ", len(b))
+
+    for i in b:
+        print(hex(i)[2:],end=" ")
+    print("")
+    print("")
+
+def print_debug(level, *args, **kwargs):
+    if DEBUG >= level:
+        print(*args,**kwargs)
+
+#
+#----------------------------------------------------------------------
+#
+def write_file(filename, string):
+    f = open(filename, "w")
+    f.write(string)
+    f.close()
+
+
+def read_file(filename):
+    f = open(filename)
+    line = f.readline()
+    f.close()
+
+    return line
+#
+#----------------------------------------------------------------------
+#
+
+def io_thread_routine(args):
+    global thread_stop
+    global thread_fd_in
+    global thread_fd_out
+    global allow_list
+  
+    print_debug(2, "Thread started")
+
+    myIfObj = usbOSIf.usbOSIf(thread_fd_out, thread_fd_in,
+                              args.max_trans_size)  # Yes, these are backwards
+
+    myServer = usb_comm.Server(myIfObj, 0.3)
+    myServer.set_debug(DEBUG)
+
+    add_allow_path(myServer, allow_list)
+
+    while (thread_stop == 0):
+        myServer.server_get_cmd_and_respond()
+
+    print_debug(2, "Thread ending")
+
+    os.close(thread_fd_in)
+    os.close(thread_fd_out)
+
+    thread_fd_in = -1
+    thread_fd_out = -1
+
+
+#
+#----------------------------------------------------------------------
+#
+
+def init_one_endpoint(path, ep_descriptor, using_configfs):
+    # Configure ep1 (low/full speed + high speed)
+    fd = os.open(path, os.O_RDWR | os.O_SYNC)
+
+    if fd <= 0:
+        print("Unable to open an endpoint", path,
+              "errno=", os.strerror(fd), file=sys.stderr)
+        sys.exit(1)
+
+    if not using_configfs:
+        s = bytes(ctypes.c_int(1)) + bytes(ep_descriptor) + bytes(ep_descriptor)
+
+        #show_raw_bytes(s)
+
+        num_bytes = os.write(fd, s)
+
+        if num_bytes != len(s):
+            print("Write error", num_bytes, os.strerror(num_bytes),
+                  file=sys.stderr)
+            sys.exit(1)
+
+    print_debug(1, ".." + path, "opened")
+
+    return fd
+
+#
+#----------------------------------------------------------------------
+#
+
+
+def init_endpoints(using_configfs):
+    global thread_fd_in
+    global thread_fd_out
+
+    ret_val = -1
+
+    if using_configfs:
+        usb_epin  = FUNCFS_USB_EPIN
+        usb_epout = FUNCFS_USB_EPOUT
+    else:
+        usb_epin  = GADGET_USB_EPIN
+        usb_epout = GADGET_USB_EPOUT
+
+    # Configure ep1
+    thread_fd_in = init_one_endpoint(usb_epin, ep_descriptor_in,
+                                     using_configfs)
+
+    # Configure ep2
+    thread_fd_out = init_one_endpoint(usb_epout, ep_descriptor_out,
+                                      using_configfs)
+
+    if (thread_fd_out > 0) and (thread_fd_in > 0):
+        ret_val = 0
+
+    else:
+        print("Endpoints EP1 and/or EP2 did not initalize")
+        sys.exit(1)
+
+    return ret_val
+
+#
+#----------------------------------------------------------------------
+#
+
+def stall_request(fd, request_type):
+    print_debug(1,"Stalled SETUP Request")
+
+    if request_type & usb1.libusb1.LIBUSB_ENDPOINT_IN:
+        num_bytes = os.read(fd, 0)
+    else:
+        num_bytes = os.write(fd, b"")
+
+#
+#----------------------------------------------------------------------
+#
+def send_language_response(fd):
+    b1 = 4      # Packet len
+    b2 = usb1.libusb1.LIBUSB_DT_STRING
+    b34 = 0x0409    # English
+
+    s = b1.to_bytes(1, 'little') + \
+        b2.to_bytes(1, 'little') + \
+        b34.to_bytes(2, 'little')
+
+    num_sent = os.write(fd, s)
+
+
+#
+#----------------------------------------------------------------------
+#
+
+def gadget_get_descriptor(fd, setup):
+    print_debug(2,".REQUEST_GET_DESCRIPTOR")
+
+    item    = setup.wValue >> 8
+
+    if setup.bRequestType != usb1.libusb1.LIBUSB_ENDPOINT_IN:
+        stall_request(fd, request.bRequestType)
+
+    elif item == usb1.libusb1.LIBUSB_DT_STRING:
+        string_id = (setup.wValue & 0xff)
+        print_debug(3, "..Get string id", string_id,"max len", setup.wLength)
+
+        # String 0 is "special" and is the language
+        if string_id == 0:
+            send_language_response(fd)
+
+        elif (string_id > 0) and (string_id < _STRINGID_MAX):
+            s = dev_strings[string_id-1]
+
+            print_debug(3, "..String found for", string_id,"=",s)
+
+            # Convert to UTF-16 (and to bytes())
+            s = s.encode('utf-16')
+
+            # Add the header to the UTF-16 string
+            b1 = len(s) + 2
+            b2 = usb1.libusb1.LIBUSB_DT_STRING
+            s = b1.to_bytes(1,'little') + b2.to_bytes(1,'little') + s
+
+            # Send it
+            num_sent = os.write(fd, s)
+        else:
+            print("String not found for ID#", string_id,
+                    "wValue=", setup.wValue, file=sys.stderr)
+
+    else:
+        print("Unhandled GET_DESCRIPTOR - Cannot return descriptor",
+                item, file=sys.stderr)
+
+
+#
+#----------------------------------------------------------------------
+#
+
+def gadget_set_configuration(fd, setup):
+    global thread_stop
+    global thread_fd_in
+    global thread_fd_out
+
+    print_debug(1,".REQUEST_SET_CONFIGURATION")
+
+    if setup.bRequestType != usb1.libusb1.LIBUSB_ENDPOINT_OUT:
+        print("..Received USB_REQUEST_SET_CONFIGURATION, but not for OUT dir", file=sys.stderr)
+
+        stall_request(fd, request.bRequestType)
+
+    else:
+        if setup.wValue == CONFIG_VALUE:
+            print_debug(2, "..Handling config request with CONFIG_VALUE")
+
+            if thread_stop != 0:
+                print_debug(3, "..Stopping old thread")
+
+                thread_stop = 1  # Signal for thread to stop
+                #time.sleep(0.2)  # Wait for thread to stop - 200 ms
+                io_thread.join(timeout=0.2)  # Wait for thread to stop - 200 ms
+
+            if thread_fd_in <= 0:
+                print_debug(3, "..Creating endpoints")
+
+                # Intializes both in and out endpoints
+                ret_val = init_endpoints(False)
+
+                if ret_val == 0:
+                    print_debug(3, "..Starting new thread")
+                    thread_stop = 0
+
+                    io_thread.daemon = True   # Die with the main thread
+                    io_thread.start()
+
+        elif setup.wValue == 0:
+            print_debug(2, "..Disable threads")
+            thread_stop = 1     # Signal for thread to stop
+        else:
+            print("Unhandled configuration value", setup.wValue, file=sys.stderr)
+
+        # Ack
+        os.read(fd, 0)
+
+
+#
+#----------------------------------------------------------------------
+#
+#
+#   handle_setup_request
+#
+#       Given a SETUP style request, determine what type it is, and
+#       send the response
+#
+
+
+def gadget_handle_setup_request(fd, setup):
+
+    request = setup.bRequest
+
+    if request == usb1.libusb1.LIBUSB_REQUEST_GET_DESCRIPTOR:
+        gadget_get_descriptor(fd, setup)
+
+    elif request == usb1.libusb1.LIBUSB_REQUEST_SET_CONFIGURATION:
+        gadget_set_configuration(fd, setup)
+
+    elif request == usb1.libusb1.LIBUSB_REQUEST_GET_INTERFACE:
+        print_debug(1, ".GET INTERFACE")
+
+        buff = b"\0"
+        os.write(fd, buff)
+
+    elif request == usb1.libusb1.LIBUSB_REQUEST_SET_INTERFACE:
+        print_debug(1, ".SET INTERFACE")
+
+        if thread_fd_in > 0:
+            fcntl.ioctl(thread_fd_in, mygadgetfs.GADGETFS_CLEAR_HALT)
+
+        if thread_fd_out > 0:
+            fcntl.ioctl(thread_fd_out, mygadgetfs.GADGETFS_CLEAR_HALT)
+
+        # Ack
+        os.read(fd, 0)
+    else:
+        print("Unhandled setup request", request, setup.bRequestType, file=sys.stderr)
+
+#
+#----------------------------------------------------------------------
+#
+#   handle_gadget_ep0
+#
+#   Loop (forever) taking in USB requests on EP0 and handling them.
+# 
+#   EP0 handles the configuration of the device, not the actual data to/from
+#
+
+def handle_gadget_ep0(fd):
+    #events = (mygadgetfs.usb_gadgetfs_event * 1)()
+    event = mygadgetfs.usb_gadgetfs_event()
+
+    while True:
+        print_debug(2, "Waiting for an EP0 event")
+
+        try:
+            num_bytes = os.readv(fd, [event])
+
+        except KeyboardInterrupt:
+            print("Ctrl-C received, exiting...", file=sys.stderr)
+            sys.exit(0)
+
+        if num_bytes < 0:
+            print("handle_gadget_ep0: Read error", num_bytes,
+                    os.strerror(num), file=sys.stderr)
+
+            return
+
+        if event.type == mygadgetfs.GADGETFS_CONNECT:
+            print_debug(1, "EP0 CONNECT")
+
+        elif event.type == mygadgetfs.GADGETFS_DISCONNECT:
+            print_debug(1, "EP0 DISCONNECT")
+            #io_thread.stop()
+            #thread_stop = 1
+
+        elif event.type == mygadgetfs.GADGETFS_SETUP:
+            print_debug(1, "EP0 SETUP")
+            gadget_handle_setup_request(fd, event.u.setup)
+
+        elif event.type == mygadgetfs.GADGETFS_NOP:
+            print_debug(1, "EP0 NOP")
+
+        elif event.type == mygadgetfs.GADGETFS_SUSPEND:
+            print_debug(1, "EP0 SUSPEND")
+
+        else:
+            print("Unhandled GADGETFS EVENT", event.type,
+                    "- ignored", file=sys.stderr)
+
+#
+#----------------------------------------------------------------------
+#
+#   create_device_descr
+#
+#   Create the descriptor needed for the GadgetFS initial config request
+#
+#
+
+def create_device_descr(args):
+    device_descriptor = mylibusb1.libusb_device_descriptor()
+
+    device_descriptor.bLength = usb1.libusb1.LIBUSB_DT_DEVICE_SIZE
+    device_descriptor.bDescriptorType = usb1.libusb1.LIBUSB_DT_DEVICE
+    device_descriptor.bDeviceClass = usb1.libusb1.LIBUSB_CLASS_COMM
+    device_descriptor.bDeviceSubClass = 0
+    device_descriptor.bDeviceProtocol = 0
+    # device_descriptor.bMaxPacketSize0 = 255 # Set by driver
+    device_descriptor.idVendor  = args.vendor_id # My own id
+    device_descriptor.idProduct = args.product_id # My own id
+    device_descriptor.bcdDevice = 0x0010 # Version
+    #  Strings
+    device_descriptor.iManufacturer = _STRINGID_MANUFACTURER
+    device_descriptor.iProduct = _STRINGID_PRODUCT
+    device_descriptor.iSerialNumber = _STRINGID_SERIAL
+    device_descriptor.bNumConfigurations = 1 # Only one configuration
+
+    return device_descriptor
+
+def create_if_descr(iInterface):
+    if_descriptor = mylibusb1.libusb_interface_descriptor()
+
+    if_descriptor.bLength = ctypes.sizeof(if_descriptor)
+    if_descriptor.bDescriptorType = usb1.libusb1.LIBUSB_DT_INTERFACE
+    if_descriptor.bInterfaceNumber = 0
+    if_descriptor.bAlternateSetting = 0
+    if_descriptor.bNumEndpoints = 2
+    #if_descriptor.bInterfaceClass = usb1.libusb1.LIBUSB_CLASS_COMM
+    if_descriptor.bInterfaceClass = usb1.libusb1.LIBUSB_CLASS_VENDOR_SPEC
+    if_descriptor.bInterfaceSubClass = 1
+    if_descriptor.bInterfaceProtocol = 1
+    if_descriptor.iInterface = iInterface
+
+    return if_descriptor
+
+def create_ep_descr(endpoint_addr, max_packet_size = 512):
+    ep_descriptor  = mylibusb1.libusb_endpoint_descriptor_noaudio()
+
+    ep_descriptor.bLength = usb1.libusb1.LIBUSB_DT_ENDPOINT_SIZE
+    ep_descriptor.bDescriptorType = usb1.libusb1.LIBUSB_DT_ENDPOINT
+    ep_descriptor.bEndpointAddress = endpoint_addr
+    ep_descriptor.bmAttributes = usb1.libusb1.LIBUSB_TRANSFER_TYPE_BULK
+    ep_descriptor.wMaxPacketSize = max_packet_size # default is HS size
+    ep_descriptor.bInterval = 1     # NAK every 1 uframe
+
+    return ep_descriptor
+
+def create_config_descr(str_id, additional_len):
+    config = mylibusb1.libusb_config_descriptor()
+
+    config.bLength = ctypes.sizeof(config)
+    config.bDescriptorType = usb1.libusb1.LIBUSB_DT_CONFIG
+    config.wTotalLength = config.bLength + additional_len
+    config.bNumInterfaces = 1
+    config.bConfigurationValue = CONFIG_VALUE
+    config.iConfiguration = str_id
+    config.bmAttributes = USB_CONFIG_ATT_ONE | USB_CONFIG_ATT_SELFPOWER
+    config.bMaxPower = 1
+
+    return config
+
+def create_ss_comp_descr():
+    comp = mylibusb1.libusb_ss_ep_comp_descriptor()
+
+    comp.bLength = ctypes.sizeof(comp)
+    comp.bDescriptorType = mylibusb1.USB_DT_SS_ENDPOINT_COMP
+    comp.bMaxBurst = 0
+    comp.bmAttributes = 0
+    comp.wBytesPerInterval = 0
+
+    return comp
+
+#
+#----------------------------------------------------------------------
+#
+#
+#   handle_ffs_ep0
+#
+#   Loop (forever) taking in USB requests on EP0 and handling them.
+#
+#   EP0 handles the configuration of the device, not the actual data to/from
+#
+
+def handle_ffs_ep0(fd):
+    global io_thread
+    global io_stop
+
+    event = myfunctionfs.usb_functionfs_event()
+
+    while True:
+        try:
+            num_bytes = os.readv(fd, [event])
+
+        except KeyboardInterrupt:
+            print("Ctrl-C received, exiting...", file=sys.stderr)
+            sys.exit(0)
+
+        if num_bytes < 0:
+            print("handle_ffs_ep0: Read error", num_bytes, os.strerror(num), file=sys.stderr)
+            return
+
+        if event.type == myfunctionfs.FUNCTIONFS_ENABLE:
+            print_debug(1, "EP0 FFS ENABLE")
+
+            handle_ffs_enable()
+
+        elif event.type == myfunctionfs.FUNCTIONFS_DISABLE:
+            print_debug(1, "EP0 FFS DISABLE")
+
+            thread_stop = 1  # Signal for thread to stop
+            #time.sleep(0.2)  # Wait for thread to stop - 200 ms
+            io_thread.join(timeout=0.2)  # Wait for thread to stop - 200 ms
+
+            #io_thread = None
+
+        elif event.type == myfunctionfs.FUNCTIONFS_SETUP:
+            print_debug(1, "EP0 FFS SETUP")
+
+            #handle_setup_request(fd, event.u.setup)
+
+        elif event.type == myfunctionfs.FUNCTIONFS_BIND:
+            print_debug(1, "EP0 FFS BIND")
+
+        elif event.type == myfunctionfs.FUNCTIONFS_UNBIND:
+            print_debug(1, "EP0 FFS UNBIND")
+
+        elif event.type == myfunctionfs.FUNCTIONFS_SUSPEND:
+            print_debug(1, "EP0 FFS SUSPEND")
+
+        elif event.type == myfunctionfs.FUNCTIONFS_RESUME:
+            print_debug(1, "EP0 FFS RESUME")
+
+
+        else:
+            print("Unhandled FUNCTIONFS EVENT", event.type, "- ignored", file=sys.stderr)
+
+
+
+
+#
+#----------------------------------------------------------------------
+#
+def send_ffs_stringtab(fd):
+    my_str = "Turnstile\0".encode()
+
+    lang_code = 0x409       # English
+
+    string_head = myfunctionfs.usb_functionfs_strings_head()
+
+    string_head.magic = myfunctionfs.FUNCTIONFS_STRINGS_MAGIC
+    string_head.str_count = 1
+    string_head.lang_count = 1
+
+    # Language code is 2 bytes
+    string_head.length = len(bytes(string_head)) + 2 + len(my_str)
+
+    my_string_config = bytes(string_head) + lang_code.to_bytes(2, 'little') + my_str
+
+    # Configure EP0
+    num_wrote = os.write(fd, my_string_config)
+
+    # Did it work?
+    if num_wrote != len(my_string_config):
+        print("Write error",num_wrote,os.strerror(num_wrote), file=sys.stderr)
+        sys.exit(1)
+
+    else:
+        print_debug(2,"..Sent string configuration to EP0")
+
+    return 1
+#
+#----------------------------------------------------------------------
+#
+def handle_ffs_enable():
+    global thread_fd_in
+    global thread_fd_out
+    global io_thread
+    global io_stop
+
+    print_debug(2, "..Creating endpoints")
+
+    # Intializes both in and out endpoints
+    # Always using_configfs since this is a ffs-only routine
+    ret_val = init_endpoints(True)
+
+    if ret_val == 0:
+        print_debug(2, "..Starting new thread")
+        thread_stop = 0
+
+        io_thread.daemon = True   # Die with the main thread
+        io_thread.start()
+
+    init_endpoints(True)        # Always using_configfs since this is a ffs-only routine
+
+#
+#----------------------------------------------------------------------
+#
+def enable_udc(udc):
+    destname = "/dev/configfs/usb_gadget/" + CONFIGFS_DIRNAME + "/UDC"
+
+    write_file(destname, udc)
+
+#
+#----------------------------------------------------------------------
+#
+def create_file_if_necessary(filename, content):
+
+    # Update the file if it doesn't exist
+    #  or has different content
+
+    if not os.path.exists(filename):
+        make_it = True
+    else:
+        f = open(filename)
+        old_content = f.read()
+
+        make_it = (old_content != content)
+
+    if make_it:
+        print_debug(2,"Writing", filename)
+
+        dirname = os.path.dirname(filename)
+
+        if not os.path.exists(dirname):
+            os.makedirs(dirname, exist_ok=True)
+
+        f = open(filename,"w")
+        f.write(content)
+        f.close()
+
+def mount_if_necessary(mountpoint, mounttype, source):
+    print_debug(2,"Checking mountpoint", mountpoint)
+
+    os.makedirs(mountpoint, exist_ok=True)
+
+    if not os.path.ismount(mountpoint):
+        mount_cmd = [ "/bin/mount",  "-t", mounttype, source, mountpoint ]
+        retcode = subprocess.call(mount_cmd, shell=False)
+
+        if retcode != 0:
+            print(" ".join(mount_cmd), "failed", file=sys.stderr)
+            print("  Check to see if", mounttype, "module is loaded")
+            sys.exit(1)
+
+#
+#----------------------------------------------------------------------
+#
+
+def create_configfs_files(args):
+    print_debug(1,"Creating files in /dev/configfs")
+
+    if not os.path.exists("/dev/configfs/usb_gadget"):
+        print("Cannot start - No /dev/configfs/usb_gadget", file=sys.stderr)
+        print("  Fix:  modprobe libcomposite", file=sys.stderr)
+        sys.exit(1)
+
+    configfs_dir = "/dev/configfs/usb_gadget/" + CONFIGFS_DIRNAME + "/"
+
+    create_file_if_necessary(configfs_dir + "idVendor",
+                             hex(args.vendor_id))
+
+    create_file_if_necessary(configfs_dir + "idProduct",
+                             hex(args.product_id))
+
+    create_file_if_necessary(configfs_dir + "strings/0x409/manufacturer",
+                             "USM-CARES")
+
+    create_file_if_necessary(configfs_dir + "strings/0x409/product",
+                             "Turnstile Device")
+
+    create_file_if_necessary(configfs_dir + "strings/0x409/serialnumber",
+                             "v2.0.1c")
+
+    create_file_if_necessary(configfs_dir + \
+            "configs/conf.1/strings/0x409/configuration",
+            "Config 1")
+
+    ffs_function_path = configfs_dir + "functions/" + FFS_DIRNAME
+    ffs_config_path = configfs_dir + "configs/conf.1/" + FFS_DIRNAME
+    os.makedirs(ffs_function_path, exist_ok=True)
+
+    if not os.path.exists(ffs_config_path):
+        os.symlink(ffs_function_path, ffs_config_path)
+
+
+def create_ffs_file(args):
+    ffs_dir = "/dev/" + FFS_DIRNAME
+
+    print_debug(1,"Creating files in", ffs_dir)
+
+    (base,ext) = FFS_DIRNAME.split(".",1)
+
+    mount_if_necessary(ffs_dir, "functionfs", ext)
+
+
+#
+#----------------------------------------------------------------------
+#
+
+def start_server(primary_device, using_configfs, args, udc=None):
+    global ep_descriptor_in
+    global ep_descriptor_out
+    global io_thread
+
+    io_thread = threading.Thread(target=io_thread_routine,
+                                 args=[args])
+
+    fd = os.open(primary_device, os.O_RDWR | os.O_SYNC )
+
+    # Did it open?
+    if fd <= 0:
+        print("Unabled to open", primary_device,
+                "(" + os.strerror(fd) + ")", file=sys.stderr)
+
+        sys.exit(1)
+    else:
+        print_debug(1,"Opened",primary_device)
+
+    device_descriptor = create_device_descr(args)
+
+    if using_configfs:
+        if_descriptor     = create_if_descr(1)
+    else:
+        if_descriptor     = create_if_descr(_STRINGID_INTERFACE)
+
+    ep_descriptor_in  = create_ep_descr(usb1.libusb1.LIBUSB_ENDPOINT_IN | 1)
+    #ep_descriptor_out = create_ep_descr(usb1.libusb1.LIBUSB_ENDPOINT_OUT | 2)
+    ep_descriptor_out = create_ep_descr(usb1.libusb1.LIBUSB_ENDPOINT_OUT | 1)
+
+    #show_raw_bytes(bytes(if_descriptor), "if_descriptor")
+    #show_raw_bytes(bytes(ep_descriptor_in), "ep_descriptor_in")
+    #show_raw_bytes(bytes(ep_descriptor_out), "ep_descriptor_out")
+
+    if using_configfs:
+        # Create the packet with all of the inital configuration for EP0
+
+        # config order
+        #   magic  (le32)
+        #   length (le32) [total length]
+        #   flags (le32)
+        #   num FS descr (incl ep0)
+        #   num HS descr (incl ep0)
+        #   num SS descr (incl ep0)
+        #   num MS OS descr
+        #   followed by all of the descriptors
+        #
+        #   (see /usr/include/linux/usb/functionfs.h)
+
+
+        if not args.superspeed:
+            flags = myfunctionfs.FUNCTIONFS_HAS_FS_DESC | \
+                    myfunctionfs.FUNCTIONFS_HAS_HS_DESC
+
+            init_config = \
+                  bytearray(ctypes.c_uint32(myfunctionfs.FUNCTIONFS_DESCRIPTORS_MAGIC_V2)) + \
+                  bytearray(ctypes.c_uint32(0)) + \
+                  bytearray(ctypes.c_uint32(flags)) + \
+                  \
+                  bytearray(ctypes.c_uint32(1 + 2)) + \
+                  bytearray(ctypes.c_uint32(1 + 2)) + \
+                  \
+                  bytearray(if_descriptor) + \
+                  bytearray(ep_descriptor_in) + \
+                  bytearray(ep_descriptor_out) + \
+                  \
+                  bytearray(if_descriptor) + \
+                  bytearray(ep_descriptor_in) + \
+                  bytearray(ep_descriptor_out)
+        else:
+            flags = myfunctionfs.FUNCTIONFS_HAS_FS_DESC | \
+                    myfunctionfs.FUNCTIONFS_HAS_HS_DESC | \
+                    myfunctionfs.FUNCTIONFS_HAS_SS_DESC
+
+            ep_ss_comp = create_ss_comp_descr()
+            ep_ss_descriptor_in = ep_descriptor_in
+            ep_ss_descriptor_out = ep_descriptor_out
+
+            ep_ss_descriptor_in.bMaxPacketSize = 1024
+            ep_ss_descriptor_out.bMaxPacketSize = 1024
+
+            init_config = \
+                  bytearray(ctypes.c_uint32(myfunctionfs.FUNCTIONFS_DESCRIPTORS_MAGIC_V2)) + \
+                  bytearray(ctypes.c_uint32(0)) + \
+                  bytearray(ctypes.c_uint32(flags)) + \
+                  \
+                  bytearray(ctypes.c_uint32(1 + 2)) + \
+                  bytearray(ctypes.c_uint32(1 + 2)) + \
+                  bytearray(ctypes.c_uint32(1 + 4)) + \
+                  \
+                  bytearray(if_descriptor) + \
+                  bytearray(ep_descriptor_in) + \
+                  bytearray(ep_descriptor_out) + \
+                  \
+                  bytearray(if_descriptor) + \
+                  bytearray(ep_descriptor_in) + \
+                  bytearray(ep_descriptor_out) + \
+                  \
+                  bytearray(if_descriptor) + \
+                  bytearray(ep_ss_descriptor_in) + \
+                  bytearray(ep_ss_comp)  + \
+                  bytearray(ep_ss_descriptor_out) + \
+                  bytearray(ep_ss_comp)
+
+            # Now compute the size (handles up to 65535 bytes in length)
+        init_config[4] = len(init_config) % 256
+        init_config[5] = len(init_config) // 256
+
+        #print(len(init_config), init_config[5], init_config[4])
+        #show_raw_bytes(init_config, "init_config (whole packet)")
+
+    else:
+        config_ls = create_config_descr(_STRINGID_CONFIG_LS,
+                                     if_descriptor.bLength + \
+                                     ep_descriptor_in.bLength + \
+                                     ep_descriptor_out.bLength)
+
+        config_hs = create_config_descr(_STRINGID_CONFIG_HS,
+                                     if_descriptor.bLength + \
+                                     ep_descriptor_in.bLength + \
+                                     ep_descriptor_out.bLength)
+
+
+        # Create the packet with all of the inital configuration for EP0
+        init_config = bytes(ctypes.c_uint32(0)) + \
+                  \
+                  bytes(config_ls) + \
+                  bytes(if_descriptor) + \
+                  bytes(ep_descriptor_in) + \
+                  bytes(ep_descriptor_out) + \
+                  \
+                  bytes(config_hs) + \
+                  bytes(if_descriptor) + \
+                  bytes(ep_descriptor_in) + \
+                  bytes(ep_descriptor_out) + \
+                  \
+                  bytes(device_descriptor)
+
+    # Configure EP0
+    num_wrote = os.write(fd, init_config)
+
+    # Did it work?
+    if num_wrote != len(init_config):
+        print("Write error",num_wrote,os.strerror(num_wrote), file=sys.stderr)
+
+        os.close(fd)
+    else:
+        print_debug(1, "EP0 initial configure - complete")
+
+        if using_configfs:
+            still_ok = send_ffs_stringtab(fd)
+
+            enable_udc(udc)
+
+            handle_ffs_ep0(fd)
+        else:
+            handle_gadget_ep0(fd)
+#
+#----------------------------------------------------------------------
+#
+def add_allow_path(myServer, allow_list):
+    for one_item in allow_list:
+
+        if "=" in one_item:
+            (real,alias) = one_item.split("=")
+
+            real = real.strip()
+            alias = alias.strip()
+
+            myServer.add_good_prefix( [ real, alias] )
+
+        else:
+            myServer.add_good_prefix(one_item.strip())
+#
+#----------------------------------------------------------------------
+#
+
+#
+#   Permit multiple config files to give the options
+#     (using a simple "key val" lines), but handle these
+#     first, so that command line settings override these
+#
+
+def read_config(parser, args, filename, silent_fail):
+    allow_lines = []
+
+    print_debug(4, "Reading config", filename)
+
+    if os.path.exists(filename):
+        f = open(filename)
+        for line in f:
+            line_parts = shlex.split(line, comments=True)
+            line_len = len(line_parts)
+
+            # Non-empty line?
+            if line_len > 0:
+                keyword = line_parts[0]
+
+                if line_len > 1:
+                    val     = " ".join(line_parts[1:])
+                else:
+                    val = None
+
+                # Handle allow-path specially
+
+                if (keyword == "allow_path") or (keyword == "allow-path"):
+
+                    allow_lines.append(val)
+
+                elif keyword in args:
+                    # Follow the data-type of the original item
+                    if type(args[keyword]) is int:
+                        val = int(val)
+
+                    if type(args[keyword]) is bool:
+                        val = True
+
+                    parser.set_defaults( ** { keyword : val } )
+
+                else:
+                    print("Unrecognized keyword \"" + cmd +
+                            "\" in file", filename, "(ignored)")
+
+    elif not silent_fail:
+        print("Warning: Could not open \"" + filename + "\"", file=sys.stderr)
+
+    return allow_lines
+
+#
+#----------------------------------------------------------------------
+#
+
+def parse_args():
+    global allow_list
+
+    parser = argparse.ArgumentParser(
+                      description="Turnstile USB Server (Device Side)",
+                      )
+
+    parser.add_argument("--config", action="append", default=[],
+                        help="Optional configuration file")
+
+    parser.add_argument("-d", "--debug", help="Level of debug info shown",
+                        type=int, default=DEBUG)
+
+    parser.add_argument("--allow-path", "--allow_path",
+                        action="append", default=[])
+
+    #parser.add_argument("-t", "--timeout",
+    #                    help="time (in seconds) to wait for USB response",
+    #                    default=0.3, type=float)
+
+    parser.add_argument("--product-id", type=int, default=0xca7e,
+                         help="Set the Product ID for the USB device seen by the client")
+
+    parser.add_argument("--vendor-id", type=int, default=0xca7e,
+                         help="Set the Vendor ID for the USB device seen by the client")
+
+    parser.add_argument("--max-trans-size", type=int, default=32 * 1024,
+                         help="Set the Maximum USB Transaction Size")
+
+    parser.add_argument("--usb-mode", default="auto",
+                        choices=["gadgetfs", "configfs", "auto" ],
+                        help="Use configfs or gadgetfs to create the gadget")
+
+    parser.add_argument("--superspeed", help=argparse.SUPPRESS,
+                        #help="Use USB 3.0 (vs. USB 2.0)",
+                        action="store_true"
+                        )
+
+
+    args = parser.parse_args()
+
+    allow_list = []
+
+    if len(args.config) == 0:
+        allow_list = read_config(parser, vars(args),
+                os.path.dirname(__file__) + "/../etc/server.conf", True)
+    else:
+        for filename in args.config:
+            allow_list.extend(read_config(parser, vars(args), filename, False))
+
+    args = parser.parse_args()
+
+    # Now add on any of the items from the command line "--allow-path" options
+    allow_list.extend(args.allow_path)
+
+    return args
+
+
+
+def main():
+    global DEBUG
+
+    args = parse_args()
+
+    DEBUG = args.debug
+
+    primary_device = None
+  
+    if args.usb_mode == "gadgetfs":
+        mount_if_necessary("/dev/gadgetfs", "gadgetfs", "none")
+
+        using_configfs = False
+
+    elif args.usb_mode == "configfs":
+        mount_if_necessary("/dev/configfs", "configfs", "none")
+
+        if not os.path.exists("/dev/configfs/usb_gadget"):
+            print_debug(1,
+                    "Trying to load libcomposite to get usb_gadget dir tree")
+
+            retcode = subprocess.call(["/usr/sbin/modprobe", "libcomposite"], shell=False)
+
+            if retcode != 0:
+                print("Cannot start - modprobe libcomposite failed",
+                        file=sys.stderr)
+                print("   Fix: is there a different module name for this?",
+                        file=sys.stderr)
+
+                sys.exit(1)
+
+        using_configfs = True
+
+    elif os.path.exists("/dev/configfs"):
+        using_configfs = True
+
+    else:
+        using_configfs = False
+
+    if using_configfs:
+        if not os.path.exists("/dev/configfs"):
+            print("Cannot start - no /dev/configfs")
+            print("   Fix:  mkdir /dev/configfs &&",
+                    "mount -t configfs none /dev/configfs")
+
+            print("   or use --use-mode configfs")
+
+        print_debug(1, "Using ConfigFS Mode")
+
+        create_configfs_files(args)
+        create_ffs_file(args)
+
+        all_udcs = os.listdir("/sys/class/udc")
+
+        if len(all_udcs) == 0:
+            print("Cannot find the UDC device")
+            print("  Fix: dtoverlay dwc2")
+
+            sys.exit(1)
+
+        first_udc = all_udcs[0]
+
+        primary_device = "/dev/ffs.1/ep0"
+        using_configfs = True
+
+    elif os.path.exists("/dev/gadgetfs"):
+        print_debug(1, "Using GadgetFS Mode")
+
+        gadget_files = os.listdir("/dev/gadgetfs")
+
+        for one_file in gadget_files:
+            if one_file.endswith(".usb"):
+                primary_device = "/dev/gadgetfs/" + one_file
+
+        if primary_device is None:
+            print("Cannot start - no .usb file in /dev/gadgetfs")
+            sys.exit(1)
+
+        using_configfs = False
+        first_udc = None        # UDC is only used for ConfigFS
+
+    else:
+
+        print("Cannot start - no /dev/configfs OR /dev/gadgetfs")
+        print("")
+
+        print("  Fix:  mkdir /dev/gadgetfs &&",
+                "mount -t gadgetfs none /dev/gadgetfs")
+        print("   OR:  mkdir /dev/configfs &&",
+                "mount -t configfs none /dev/configfs")
+
+        print("")
+
+        print("May need \"dtoverlay dwc2\" prior to the mount command")
+          
+        sys.exit(1)
+  
+    start_server(primary_device, using_configfs, args, first_udc)
+
+
+main()

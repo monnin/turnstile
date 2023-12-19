@@ -1,0 +1,53 @@
+<html>
+<head>
+<title>Turnstile - Copy files to VirtD</title>
+</head>
+<body>
+<div style="float: right"><a href="{{logouturl}}">Logout</a></div>
+
+<p>Welcome {{user}},</p>
+
+<h2>You can tranfer data to VirtD by uploading a file, by entering a URL, or by entering text into a box</h2>
+
+
+<div style="display: inline-flex; flex-direction: column; padding: 12px;">
+
+<form method="post" action="{{fileupload}}" enctype="multipart/form-data">
+<div style="border: 3px solid black; padding: 6px;">
+<strong>Upload a File</strong>
+<br /><br />
+<input type="file" name="file" />
+<br /><br />
+<input type="submit" value="Upload" />
+</div>
+</form>
+
+<br />
+
+<form method="post" action="{{urlupload}}">
+<div style="border: 3px solid black; padding: 6px;">
+<strong>Copy from a Public URL</strong>
+<br /><br />
+<input type="text" name="urlname" size="70" value="https://example.com" />
+<br /><br />
+<input type="submit" value="Retrieve" />
+</div>
+</form>
+
+<br />
+
+<form method="post" action="{{textupload}}">
+<div style="border: 3px solid black; padding: 6px;">
+<strong>Create a Text File</strong>
+<br /><br />
+<textarea id="src-text" name="sourcetext" rows="8" cols="72">Text entered here will be converted into a .txt file on VirtD.
+</textarea>
+<br /><br />
+<input type="submit" value="Send" />
+</div>
+</form>
+
+</div>
+
+</body>
+</html>
