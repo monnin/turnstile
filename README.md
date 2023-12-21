@@ -1,4 +1,4 @@
-# Turnstile - A Unidirectional System for Medium-Security Isolated Clusters
+# Turnstile - A Unidirectional File Transfer System for Medium-Security Isolated Clusters
 
 Turnstile implements a secure method to copy files into an (otherwise) isolated computing cluster.  
 It uses a single USB connection between two computers (physical or virtual) and limits the the types of permitted communication 
